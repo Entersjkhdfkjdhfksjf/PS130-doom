@@ -1,4 +1,5 @@
-// DOOM launcher - CHDK module for the PowerShot SD1000 (PLAY mode).
+// DOOM launcher - CHDK module for the Canon PowerShot SX130 IS, fw 101f (PLAY mode).
+// (Ported from the SD1000/IXUS 70 launcher: see docs/SX130IS-PORT.md for the per-camera changes.)
 // Loads the standalone DOOM blob (A/DOOM.BIN) into the raw buffer's uncached alias, wires a
 // callback table (timing/input/draw/file IO/arena), and jumps into it. The blob runs uncached
 // (no I-cache invalidation needed). DOOM reads A/DOOM1.WAD (shareware) via the file callbacks.
@@ -20,6 +21,8 @@
 #include "doom_chdk_abi.h"
 
 extern void *hook_raw_image_addr(void);
+extern void *vid_get_viewport_active_buffer(void);   // in PLAY mode = Canon's display viewport (fb_d)
+extern int   vid_get_viewport_byte_width(void);
 extern void  dcache_clean_all(void);
 extern unsigned char *vid_get_bitmap_fb(void);
 extern void  vid_bitmap_refresh(void);     // repaint Canon's bitmap/overlay (restore screen on exit)
@@ -40,8 +43,14 @@ static void gui_doom_menu_btn(void) { }
 gui_handler GUI_MODE_DOOM =
     { GUI_MODE_MODULE, gui_doom_draw, gui_doom_kbd_process, gui_doom_menu_btn, 0, GUI_MODE_FLAG_NODRAWRESTORE };
 
-#define BLOB_ADDR 0x00E80000u         // CACHED alias of the raw buffer (was 0x10E80000 uncached)
-#define RAW_SIZE  0x800000u           // 8MB
+// SX130 IS (DIGIC 4): hook_raw_image_addr() = 0x41F3B020 ("CRAW BUFF" in Canon's log). DIGIC 4
+// marks the UNCACHED alias with bit 0x40000000 (DIGIC 3 / SD1000 used 0x10000000), so the cached
+// alias is 0x01F3B020. The raw buffer is 4080*3048*12/8 = 0x11CA240 bytes (~17.8MB).
+// The blob is linked at BLOB_ADDR, the first 64KB boundary above the buffer base. KEEP THIS IN
+// SYNC with src/doom_blob.ld.
+#define UNCACHED_BIT 0x40000000u
+#define BLOB_ADDR 0x01F40000u         // CACHED alias, inside the raw buffer
+#define RAW_SIZE  0x011CA240u         // CAM_RAW_ROWPIX*CAM_RAW_ROWS*12/8
 
 // Invalidate the entire instruction cache (ARMv5 CP15 c7,c5,0). The module runs privileged, so we
 // issue this directly (icache_flush_all isn't exported to modules; only dcache_clean_all is). MCR
@@ -80,10 +89,10 @@ static void         cb_sleep(unsigned int ms) { msleep(ms); }
 // format UYVYYY = 6 bytes per 4 px: [U, Y0, V, Y1, Y2, Y3], U/V signed (0 = neutral).
 // We precompute each DOOM palette index -> (Y,U,V) on palette change, plus nearest-neighbour
 // scale maps so DOOM's 320x200 fills the whole 720x240 viewport (full screen, no black bars).
-#define VP_BW   1080          // vid_get_viewport_byte_width() for 102a
+#define VP_BW   1080          // UYVYYY row stride; also checked at runtime against vid_get_viewport_byte_width()
 #define VP_W    720           // pixels per row
 #define VP_H    240           // rows in PLAY mode
-#define VP_FB_D (*(unsigned char **)0x94408)   // vid_get_viewport_fb_d (PLAY display buffer)
+#define VP_FB_D ((unsigned char *)vid_get_viewport_active_buffer())   // PLAY display buffer
 
 static unsigned char g_y[256];           // luma per index (0..255)
 static signed char   g_u[256], g_v[256]; // chroma per index (signed, centered 0)
@@ -206,10 +215,16 @@ static void launch(void) {
                    camera_screen.height - 1, MAKE_COLOR(COLOR_BLACK, COLOR_BLACK), RECT_BORDER0 | DRAW_FILLED);
     scr_log("DOOM LAUNCHER");
 
-    // hook_raw_image_addr() hands back the UNCACHED alias (0x10xxxxxx); strip the alias bit so
+    // hook_raw_image_addr() hands back the UNCACHED alias (0x41xxxxxx on DIGIC 4); strip the alias bit so
     // every address we compute (blob load, arena) lives in the CACHED alias we now execute from.
-    unsigned int raw = (unsigned int)hook_raw_image_addr() & ~0x10000000u;
-    if (raw == 0 || raw > BLOB_ADDR) { sprintf(msg, "bad raw 0x%08x - abort", raw); scr_log(msg); return; }
+    unsigned int raw = (unsigned int)hook_raw_image_addr() & ~UNCACHED_BIT;
+    sprintf(msg, "raw=0x%08x", raw); scr_log(msg);
+    if (raw == 0 || raw > BLOB_ADDR || BLOB_ADDR >= raw + RAW_SIZE) {
+        sprintf(msg, "bad raw 0x%08x - abort", raw); scr_log(msg); return;
+    }
+    if (vid_get_viewport_byte_width() != VP_BW) {
+        sprintf(msg, "vp stride %d != %d - abort", vid_get_viewport_byte_width(), VP_BW); scr_log(msg); return;
+    }
 
     scr_log("loading A/DOOM.BIN ...");
     int fd = open("A/DOOM.BIN", O_RDONLY, 0777);
